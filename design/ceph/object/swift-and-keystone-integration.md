@@ -82,9 +82,9 @@ Annotations:
   `rgw_keystone_` and replacing upper case letters by their lower case
   letter followed by an underscore. E.g. `tokenCacheSize` maps to
   `rgw_keystone_token_cache_size`.
-* `[2]` These settings are required in the `keystone` section if
+* `[2]` These settings are required if the `keystone` section is
   present.
-* `[1]` The name of the secret containing the credentials for the
+* `[3]` The name of the secret containing the credentials for the
   service user account used by RGW. It has to be in the same namespace
   as the object store resource.
 
@@ -110,7 +110,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: rgw-service-user
-data:
+stringData:
   OS_PASSWORD: "horse staples battery correct"
   OS_USERNAME: "ceph-rgw"
   OS_PROJECT_NAME: "admin"
