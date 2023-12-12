@@ -110,7 +110,72 @@ func (c *clusterConfig) generateKeyring(rgwConfig *rgwConfig) (string, error) {
 	return keyring, s.CreateOrUpdate(rgwConfig.ResourceName, keyring)
 }
 
+func mapKeystoneSecretToConfig(cfg map[string]string, secret *v1.Secret) (map[string]string, error) {
+
+	data := make(map[string]string)
+	for key, value := range secret.Data {
+
+		logger.Debugf("keystone secret %s => %s", key, value)
+		data[key] = string(value[:])
+
+	}
+
+	authType, ok := data["OS_AUTH_TYPE"]
+	if ok {
+		if authType != "password" {
+			return nil, errors.New(fmt.Sprintf("OS_AUTHTYPE %s is not supported. Only OS_AUTH_TYPE password is supported!", authType))
+		}
+	}
+
+	apiVersion, ok := data["OS_IDENTITY_API_VERSION"]
+	if ok {
+		if apiVersion != "3" {
+			return nil, errors.New(fmt.Sprintf("OS_IDENTITY_API_VERSION %s is not supported! Only OS_IDENTITY_API_VERSION 3 is supported!", apiVersion))
+		}
+	}
+
+	projectDomain, ok := data["OS_PROJECT_DOMAIN_NAME"]
+	if !ok {
+		return nil, errors.New("Missing OS_PROJECT_DOMAIN_NAME")
+	}
+
+	userDomain, ok := data["OS_USER_DOMAIN_NAME"]
+	if !ok {
+		return nil, errors.New("Missing OS_USER_DOMAIN_NAME")
+	}
+
+	if projectDomain != userDomain {
+		return nil, errors.New("The user domain name does not match the project domain name.")
+	}
+
+	project, ok := data["OS_PROJECT_NAME"]
+	if !ok {
+		return nil, errors.New("No OS_PROJECT_NAME set.")
+	}
+
+	username, ok := data["OS_USERNAME"]
+	if !ok {
+		return nil, errors.New("No OS_USERNAME set.")
+	}
+
+	password, ok := data["OS_PASSWORD"]
+	if !ok {
+		return nil, errors.New("No OS_PASSWORD set.")
+	}
+
+	// keystone api version 3 should be used today
+	cfg["rgw_keystone_api_version"] = "3"
+	cfg["rgw_keystone_admin_domain"] = userDomain
+	cfg["rgw_keystone_admin_project"] = project
+	cfg["rgw_keystone_admin_user"] = username
+	cfg["rgw_keystone_admin_password"] = password
+
+	return cfg, nil
+}
+
 func (c *clusterConfig) setFlagsMonConfigStore(rgwConfig *rgwConfig) error {
+	var err error
+
 	monStore := cephconfig.GetMonStore(c.context, c.clusterInfo)
 	who := generateCephXUser(rgwConfig.ResourceName)
 	configOptions := make(map[string]string)
@@ -126,9 +191,72 @@ func (c *clusterConfig) setFlagsMonConfigStore(rgwConfig *rgwConfig) error {
 	configOptions["rgw_zone"] = rgwConfig.Zone
 	configOptions["rgw_zonegroup"] = rgwConfig.ZoneGroup
 
+	if ks := rgwConfig.Auth.Keystone; ks != nil {
+
+		logger.Info("Configuring Authentication with keystone")
+
+		configOptions["rgw_keystone_url"] = ks.Url
+		configOptions["rgw_keystone_accepted_roles"] = strings.Join(ks.AcceptedRoles, ",")
+		if ks.ImplicitTenants != "" {
+			// XXX: where do we validate this?
+			configOptions["rgw_keystone_implicit_tenants"] = string(ks.ImplicitTenants)
+		}
+		if ks.TokenCacheSize != nil {
+			configOptions["rgw_keystone_token_cache_size"] = fmt.Sprintf("%d", *ks.TokenCacheSize)
+		}
+		if rgwConfig.KeystoneSecret == nil {
+			return errors.New("Cannot find keystone secret")
+		}
+
+		configOptions, err = mapKeystoneSecretToConfig(configOptions, rgwConfig.KeystoneSecret)
+		if err != nil {
+			logger.Infof("error mapping keystone secret %s to config: %s", rgwConfig.KeystoneSecret.Name, err)
+			return err
+		}
+	} else {
+		logger.Info("Authentication with keystone disabled")
+	}
+
+	s3disabled := false
+	if s3 := rgwConfig.Protocols.S3; s3 != nil {
+		if s3.Enabled != nil && !*s3.Enabled {
+			s3disabled = true
+		}
+
+		if s3.AuthUseKeystone != nil {
+			configOptions["rgw_s3_auth_use_keystone"] = fmt.Sprintf("%t", *s3.AuthUseKeystone)
+		}
+	}
+
+	if swift := rgwConfig.Protocols.Swift; swift != nil {
+		if swift.AccountInUrl != nil {
+			configOptions["rgw_swift_account_in_url"] = fmt.Sprintf("%t", *swift.AccountInUrl)
+		}
+		if swift.UrlPrefix != nil {
+			configOptions["rgw_swift_url_prefix"] = *swift.UrlPrefix
+		}
+		if swift.VersioningEnabled != nil {
+			configOptions["rgw_swift_versioning_enabled"] = fmt.Sprintf("%t", *swift.VersioningEnabled)
+		}
+	}
+
+	if s3disabled {
+		// XXX: how to handle enabled APIs? We only configure s3 and
+		// swift in the resource, `admin` is required for the operator to
+		// work, `swift_auth` is required to access swift without keystone
+		// – not sure about the additional APIs
+
+		// Swift was enabled so far already by default, so perhaps better
+		// not change that if someon relies on it.
+
+		configOptions["rgw_enabled_apis"] = "s3website, swift, swift_auth, admin, sts, iam, notifications"
+	}
+
 	for flag, val := range configOptions {
+		logger.Debugf("Set %s to %q on %q", flag, val, who)
 		err := monStore.Set(who, flag, val)
 		if err != nil {
+			logger.Debugf("failed to setup config option: %s to %q on %q: %s", flag, val, who, err)
 			return errors.Wrapf(err, "failed to set %q to %q on %q", flag, val, who)
 		}
 	}
